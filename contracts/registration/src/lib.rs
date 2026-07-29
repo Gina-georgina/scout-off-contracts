@@ -60,10 +60,8 @@ const INSTANCE_TTL_MAX: u32 = 500;
 // and must live as long as the profiles they index.
 const PERSISTENT_TTL_MIN: u32 = 500;
 const PERSISTENT_TTL_MAX: u32 = 518_400;
-const ADMIN_BUMP_LEDGERS: u32 = 518_400;
-
 // Admin key TTL — kept equal to PERSISTENT_TTL_MAX for simplicity.
-const ADMIN_BUMP_LEDGERS: u32 = 2_000;
+const ADMIN_BUMP_LEDGERS: u32 = 518_400;
 
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -831,6 +829,32 @@ impl RegistrationContract {
     /// Returns the deployed crate version (from Cargo.toml at build time).
     pub fn version(env: Env) -> String {
         String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Explicit paginated variant of `filter_players`.
+    ///
+    /// Follows the same pagination-parameter convention already established by
+    /// `get_progress_history_page` and `get_validator_milestones_page`:
+    /// `limit` is capped at 50 internally, and `offset` skips that many
+    /// eligible (non-deactivated, filter-matching) entries before collecting.
+    ///
+    /// - Pass an empty string for `region` to match players in any region.
+    /// - Pass an empty string for `position` to match players in any position.
+    /// - When `region` is non-empty, the composite `PlayersByLevelRegion` index
+    ///   is used for efficient lookup (same fast path as `filter_players`).
+    /// - Deactivated players are excluded from results.
+    ///
+    /// Returns a `FilterResult` where `next_cursor` is the value to pass as
+    /// `offset` on the next call, or `0` when there are no further results.
+    pub fn filter_players_page(
+        env: Env,
+        region: String,
+        position: String,
+        min_level: ProgressLevel,
+        offset: u32,
+        limit: u32,
+    ) -> Result<FilterResult, ScoutChainError> {
+        Self::filter_players(env, region, position, min_level, offset, limit)
     }
 
     // -------------------------------------------------------------------------
@@ -2835,5 +2859,213 @@ mod tests {
         assert_eq!(profile_updated.vitals.region, vitals_max.region);
         assert_eq!(profile_updated.vitals.nationality, vitals_max.nationality);
         assert_eq!(profile_updated.vitals.age, vitals_max.age);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #846: filter_players_page explicit paginated variant
+    // -------------------------------------------------------------------------
+
+    /// filter_players_page with offset=0, limit=20 returns all matching players
+    /// when fewer than 20 exist — same as filter_players.
+    #[test]
+    fn test_filter_players_page_basic_region_position() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        let wallet1 = Address::generate(&env);
+        let vitals1 = PlayerVitals {
+            age: 20,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let id1 = client.register_player(&wallet1, &vitals1, &hashes);
+
+        let wallet2 = Address::generate(&env);
+        let vitals2 = PlayerVitals {
+            age: 22,
+            position: String::from_str(&env, "Midfielder"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Nigeria"),
+        };
+        client.register_player(&wallet2, &vitals2, &hashes);
+
+        let result = client.filter_players_page(
+            &String::from_str(&env, "West Africa"),
+            &String::from_str(&env, "Forward"),
+            &ProgressLevel::Unverified,
+            &0u32,
+            &20u32,
+        );
+
+        assert_eq!(result.profiles.len(), 1);
+        assert_eq!(result.profiles.get(0).unwrap().player_id, id1);
+        assert_eq!(result.next_cursor, 0);
+    }
+
+    /// filter_players_page respects offset — skips the first N eligible results.
+    #[test]
+    fn test_filter_players_page_offset_skips_entries() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        // Register 5 Forwards in West Africa
+        let mut ids = soroban_sdk::Vec::new(&env);
+        for _ in 0..5 {
+            let wallet = Address::generate(&env);
+            let vitals = PlayerVitals {
+                age: 19,
+                position: String::from_str(&env, "Forward"),
+                region: String::from_str(&env, "West Africa"),
+                nationality: String::from_str(&env, "Ghana"),
+            };
+            ids.push_back(client.register_player(&wallet, &vitals, &hashes));
+        }
+
+        // Page 1: limit=3, offset=0 → first 3
+        let page1 = client.filter_players_page(
+            &String::from_str(&env, "West Africa"),
+            &String::from_str(&env, "Forward"),
+            &ProgressLevel::Unverified,
+            &0u32,
+            &3u32,
+        );
+        assert_eq!(page1.profiles.len(), 3);
+        assert_ne!(page1.next_cursor, 0, "should have next page");
+
+        // Page 2: offset=3, limit=3 → last 2
+        let page2 = client.filter_players_page(
+            &String::from_str(&env, "West Africa"),
+            &String::from_str(&env, "Forward"),
+            &ProgressLevel::Unverified,
+            &3u32,
+            &3u32,
+        );
+        assert_eq!(page2.profiles.len(), 2);
+        assert_eq!(page2.next_cursor, 0, "no more pages");
+    }
+
+    /// filter_players_page caps limit at 50 — passing a higher value is silently
+    /// clamped, matching the behaviour documented for filter_players.
+    #[test]
+    fn test_filter_players_page_limit_capped_at_50() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        // Register 55 players — more than the 50 cap.
+        for _ in 0..55 {
+            let wallet = Address::generate(&env);
+            let vitals = PlayerVitals {
+                age: 20,
+                position: String::from_str(&env, "Defender"),
+                region: String::from_str(&env, "Europe"),
+                nationality: String::from_str(&env, "France"),
+            };
+            client.register_player(&wallet, &vitals, &hashes);
+        }
+
+        let result = client.filter_players_page(
+            &String::from_str(&env, "Europe"),
+            &String::from_str(&env, "Defender"),
+            &ProgressLevel::Unverified,
+            &0u32,
+            &200u32, // intentionally above cap
+        );
+
+        assert_eq!(
+            result.profiles.len(),
+            50,
+            "limit must be capped at 50 regardless of input"
+        );
+        assert_ne!(result.next_cursor, 0, "5 more results remain after cap");
+    }
+
+    /// filter_players_page with empty region falls back to full PlayerIndex scan.
+    #[test]
+    fn test_filter_players_page_empty_region_scans_all() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        let w1 = Address::generate(&env);
+        let v1 = PlayerVitals {
+            age: 21,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        client.register_player(&w1, &v1, &hashes);
+
+        let w2 = Address::generate(&env);
+        let v2 = PlayerVitals {
+            age: 23,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "Europe"),
+            nationality: String::from_str(&env, "Italy"),
+        };
+        client.register_player(&w2, &v2, &hashes);
+
+        // Empty region — must see Forwards from all regions.
+        let result = client.filter_players_page(
+            &String::from_str(&env, ""),
+            &String::from_str(&env, "Forward"),
+            &ProgressLevel::Unverified,
+            &0u32,
+            &20u32,
+        );
+        assert_eq!(result.profiles.len(), 2);
+        assert_eq!(result.next_cursor, 0);
+    }
+
+    /// Deactivated players are excluded from filter_players_page results.
+    #[test]
+    fn test_filter_players_page_excludes_deactivated() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        let w1 = Address::generate(&env);
+        let v1 = PlayerVitals {
+            age: 20,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let id1 = client.register_player(&w1, &v1, &hashes);
+
+        let w2 = Address::generate(&env);
+        let v2 = PlayerVitals {
+            age: 22,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Nigeria"),
+        };
+        let id2 = client.register_player(&w2, &v2, &hashes);
+
+        // Deactivate player 1 via the flag directly (deactivate_player from #844).
+        client.deactivate_player(&id1);
+
+        let result = client.filter_players_page(
+            &String::from_str(&env, "West Africa"),
+            &String::from_str(&env, "Forward"),
+            &ProgressLevel::Unverified,
+            &0u32,
+            &20u32,
+        );
+
+        assert_eq!(result.profiles.len(), 1);
+        assert_eq!(result.profiles.get(0).unwrap().player_id, id2);
     }
 }
