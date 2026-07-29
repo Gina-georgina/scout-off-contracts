@@ -6,7 +6,7 @@ mod types;
 use errors::ScoutChainError;
 use types::{
     ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerStatus, PlayerSummary,
-    ProgressLevel, ScoutProfile, StoredPlayerProfile,
+    ProgressLevel, ScoutProfile, ScoutStatus, StoredPlayerProfile,
 };
 // `PlayerVitals` is an *input* type of the public `register_player` function, so
 // it must be nameable by external callers (integration tests, generated
@@ -60,10 +60,8 @@ const INSTANCE_TTL_MAX: u32 = 500;
 // and must live as long as the profiles they index.
 const PERSISTENT_TTL_MIN: u32 = 500;
 const PERSISTENT_TTL_MAX: u32 = 518_400;
-const ADMIN_BUMP_LEDGERS: u32 = 518_400;
-
 // Admin key TTL — kept equal to PERSISTENT_TTL_MAX for simplicity.
-const ADMIN_BUMP_LEDGERS: u32 = 2_000;
+const ADMIN_BUMP_LEDGERS: u32 = 518_400;
 
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -622,6 +620,31 @@ impl RegistrationContract {
             Ok(PlayerStatus::Deactivated)
         } else {
             Ok(PlayerStatus::Active)
+        }
+    }
+
+    /// Return the current status of a scout account.
+    ///
+    /// Mirrors `verification.get_validator_status` — returns a structured enum
+    /// rather than a raw boolean, consolidating all scout state into one call.
+    ///
+    /// - `Active`        — scout exists and has not been deactivated.
+    /// - `Deactivated`   — scout exists but has been soft-deactivated by admin
+    ///                     (see companion issue #844 / `deactivate_scout`).
+    /// - `NotRegistered` — no scout profile found for the given `scout_id`.
+    pub fn get_scout_status(env: Env, scout_id: u64) -> ScoutStatus {
+        if !env.storage().persistent().has(&DataKey::Scout(scout_id)) {
+            return ScoutStatus::NotRegistered;
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ScoutDeactivated(scout_id))
+            .unwrap_or(false)
+        {
+            ScoutStatus::Deactivated
+        } else {
+            ScoutStatus::Active
         }
     }
 
@@ -2835,5 +2858,94 @@ mod tests {
         assert_eq!(profile_updated.vitals.region, vitals_max.region);
         assert_eq!(profile_updated.vitals.nationality, vitals_max.nationality);
         assert_eq!(profile_updated.vitals.age, vitals_max.age);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #845: get_scout_status enum query
+    // -------------------------------------------------------------------------
+
+    /// A newly registered scout returns Active status.
+    #[test]
+    fn test_get_scout_status_active_for_new_scout() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.register_scout(&wallet, &String::from_str(&env, "Europe"));
+
+        assert_eq!(client.get_scout_status(&scout_id), types::ScoutStatus::Active);
+    }
+
+    /// Querying an unregistered scout_id returns NotRegistered.
+    #[test]
+    fn test_get_scout_status_not_registered_for_unknown_id() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        assert_eq!(
+            client.get_scout_status(&9999u64),
+            types::ScoutStatus::NotRegistered
+        );
+    }
+
+    /// After setting ScoutDeactivated flag, get_scout_status returns Deactivated.
+    /// Uses the internal storage key so this test is self-contained on this branch
+    /// (does not require deactivate_scout from #844 to be merged first).
+    #[test]
+    fn test_get_scout_status_deactivated_when_flag_set() {
+        use soroban_sdk::testutils::Address as _;
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.register_scout(&wallet, &String::from_str(&env, "West Africa"));
+
+        // Write the deactivation flag directly through the env.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&types::DataKey::ScoutDeactivated(scout_id), &true);
+        });
+
+        assert_eq!(
+            client.get_scout_status(&scout_id),
+            types::ScoutStatus::Deactivated
+        );
+    }
+
+    /// After clearing ScoutDeactivated flag, get_scout_status returns Active again.
+    #[test]
+    fn test_get_scout_status_active_after_flag_cleared() {
+        use soroban_sdk::testutils::Address as _;
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.register_scout(&wallet, &String::from_str(&env, "Europe"));
+
+        // Set flag, then clear it.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&types::DataKey::ScoutDeactivated(scout_id), &true);
+        });
+        assert_eq!(
+            client.get_scout_status(&scout_id),
+            types::ScoutStatus::Deactivated
+        );
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .remove(&types::DataKey::ScoutDeactivated(scout_id));
+        });
+        assert_eq!(
+            client.get_scout_status(&scout_id),
+            types::ScoutStatus::Active
+        );
     }
 }
